@@ -17,53 +17,75 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# ADVANCED OPTIMIZATION: Multi-level Caching
+# CẤU HÌNH CHUNG
+# ============================================
+
+# Scales mặc định cho tất cả template matching
+DEFAULT_SCALES = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+
+# Scales cho các template cụ thể (có thể tùy chỉnh)
+TEMPLATE_SCALES = {
+    'item_nv': [0.8, 0.9, 1.0, 1.1, 1.2],  # Tiêu đề nhiệm vụ
+    'btn_xacnhan': [0.7, 0.8, 0.9, 1.0, 1.1, 1.2],  # Nút xác nhận
+    'captra': [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5],  # Captcha
+}
+
+# ============================================
+# TỐI ƯU HÓA NÂNG CAO: Bộ nhớ đệm nhiều cấp
 # ============================================
 
 class TemplateCache:
-    """Cache template với pre-computed scaled versions"""
+    """Cache template với các phiên bản đã được scale sẵn"""
     def __init__(self):
         self._cache = {}
         self._lock = threading.Lock()
     
-    def get(self, path, scales=[0.9, 1.0, 1.1]):
+    def get(self, path, scales=None):
         """Lấy template đã scale sẵn từ cache"""
+        if scales is None:
+            scales = DEFAULT_SCALES
+        
         cache_key = (path, tuple(scales))
         
         with self._lock:
             if cache_key in self._cache:
                 return self._cache[cache_key]
             
-            # Load và pre-compute tất cả scales
+            # Load template
             template = cv2.imread(path)
             if template is None:
+                logger.error(f"❌ Không đọc được template: {path}")
                 return None
             
+            # Pre-compute tất cả scales
             scaled_templates = []
+            temp_h, temp_w = template.shape[:2]
+            
             for scale in scales:
                 if scale == 1.0:
-                    scaled_templates.append((template, scale))
+                    scaled_templates.append((template, scale, temp_w, temp_h))
                 else:
-                    w = int(template.shape[1] * scale)
-                    h = int(template.shape[0] * scale)
-                    resized = cv2.resize(template, (w, h), interpolation=cv2.INTER_LINEAR)
-                    scaled_templates.append((resized, scale))
+                    new_w = int(temp_w * scale)
+                    new_h = int(temp_h * scale)
+                    resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    scaled_templates.append((resized, scale, new_w, new_h))
             
             self._cache[cache_key] = scaled_templates
-            logger.info(f"✅ Cached template: {path} với {len(scales)} scales")
+            logger.info(f"✅ Đã cache template: {os.path.basename(path)} với {len(scales)} tỉ lệ")
             return scaled_templates
     
     def clear(self):
-        """Clear cache"""
+        """Xóa cache"""
         with self._lock:
             self._cache.clear()
+            logger.info("🗑️  Đã xóa cache template")
 
 class ScreenshotBuffer:
     """Buffer để tái sử dụng screenshot trong cùng 1 cycle"""
-    def __init__(self, ttl=0.5):
+    def __init__(self, ttl=0.3):
         self._buffer = None
         self._timestamp = 0
-        self._ttl = ttl  # Time to live (giây)
+        self._ttl = ttl
         self._lock = threading.Lock()
     
     def get(self, force_refresh=False):
@@ -71,15 +93,13 @@ class ScreenshotBuffer:
         with self._lock:
             current_time = time.time()
             
-            # Kiểm tra cache còn valid không
             if not force_refresh and self._buffer is not None:
                 age = current_time - self._timestamp
                 if age < self._ttl:
-                    logger.debug(f"♻️  Reusing screenshot (age: {age:.2f}s)")
+                    logger.debug(f"♻️  Tái sử dụng ảnh chụp (tuổi: {age:.2f}s)")
                     return self._buffer
             
-            # Capture mới
-            logger.debug("📸 Capturing new screenshot")
+            logger.debug("📸 Đang chụp ảnh màn hình mới")
             data = adb_screencap_bytes()
             img = Image.open(io.BytesIO(data))
             self._buffer = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -88,94 +108,179 @@ class ScreenshotBuffer:
             return self._buffer
     
     def invalidate(self):
-        """Vô hiệu hóa cache (sau khi tap/swipe)"""
+        """Vô hiệu hóa cache sau khi tap/swipe"""
         with self._lock:
             self._timestamp = 0
 
 # Global instances
 _template_cache = TemplateCache()
-_screenshot_buffer = ScreenshotBuffer(ttl=0.3)  # 300ms TTL
-_executor = ThreadPoolExecutor(max_workers=2)
+_screenshot_buffer = ScreenshotBuffer(ttl=0.3)
 
-# Pre-load templates at startup
-def preload_templates():
-    """Pre-load tất cả templates vào cache khi khởi động"""
-    templates = [
-        r"./templates/item_nv.jpg",
-        r"./templates/btn_xacnhan.jpg"
-    ]
+# ============================================
+# HÀM CHÍNH: Tìm kiếm template đa tỉ lệ
+# ============================================
+
+def match_template_multiscale(screen_bgr, template_path, threshold=0.6, 
+                              scales=None, early_exit_conf=0.9, debug=False):
+    """
+    🎯 HÀM CHÍNH: Tìm kiếm template đa tỉ lệ
     
-    logger.info("🔄 Pre-loading templates...")
-    for path in templates:
-        if os.path.exists(path):
-            _template_cache.get(path)
-    logger.info("✅ Templates pre-loaded!")
+    Tham số:
+        screen_bgr: Ảnh màn hình dạng BGR
+        template_path: Đường dẫn tới file template
+        threshold: Ngưỡng độ tin cậy (0.0-1.0)
+        scales: Danh sách tỉ lệ cần thử (None = dùng mặc định)
+        early_exit_conf: Ngưỡng để dừng sớm khi tìm thấy match rất tốt
+        debug: Nếu True lưu ảnh debug
+    
+    Trả về:
+        dict: {
+            'found': bool,
+            'confidence': float,
+            'location': (x, y),  # Tọa độ tâm
+            'bbox': (x, y, w, h),
+            'scale': float
+        }
+    """
+    result = {
+        'found': False,
+        'confidence': 0.0,
+        'location': None,
+        'bbox': None,
+        'scale': 1.0
+    }
+    
+    # Lấy screen size
+    screen_h, screen_w = screen_bgr.shape[:2]
+    
+    # Lấy scaled templates từ cache
+    scaled_templates = _template_cache.get(template_path, scales=scales)
+    if scaled_templates is None:
+        return result
+    
+    best_val = 0
+    best_match = None
+    best_scale = 1.0
+    
+    # Thử tất cả scales
+    for template, scale, temp_w, temp_h in scaled_templates:
+        # Skip nếu template lớn hơn screen
+        if temp_w > screen_w or temp_h > screen_h:
+            logger.debug(f"⏭️  Skip scale {scale:.2f} (quá lớn: {temp_w}x{temp_h})")
+            continue
+        
+        # Match template
+        match_result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(match_result)
+        
+        logger.debug(f"📏 Scale {scale:.2f} ({temp_w}x{temp_h}) -> conf={max_val:.4f}")
+        
+        # Cập nhật best match
+        if max_val > best_val:
+            best_val = max_val
+            best_match = (max_loc, temp_w, temp_h)
+            best_scale = scale
+            
+            # Early exit nếu tìm thấy match rất tốt
+            if max_val >= early_exit_conf:
+                logger.debug(f"⚡ Dừng sớm ở tỉ lệ {scale:.2f} (độ tin cậy={max_val:.4f})")
+                break
+    
+    # Kiểm tra threshold
+    if best_val >= threshold and best_match:
+        top_left, w, h = best_match
+        center_x = top_left[0] + w // 2
+        center_y = top_left[1] + h // 2
+        
+        result = {
+            'found': True,
+            'confidence': best_val,
+            'location': (center_x, center_y),
+            'bbox': (top_left[0], top_left[1], w, h),
+            'scale': best_scale
+        }
+        logger.info(f"✅ Tìm thấy ở tỉ lệ={best_scale:.2f}, độ tin cậy={best_val:.4f}, tâm=({center_x}, {center_y})")
+
+        # Debug visualization
+        if debug:
+            debug_img = screen_bgr.copy()
+            cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (0, 255, 0), 3)
+            cv2.circle(debug_img, (center_x, center_y), 8, (0, 0, 255), -1)
+
+            text = f"Conf: {best_val:.3f} | Scale: {best_scale:.2f}"
+            cv2.putText(debug_img, text, (top_left[0], top_left[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            debug_filename = f"debug_{os.path.basename(template_path).split('.')[0]}.png"
+            cv2.imwrite(debug_filename, debug_img)
+            logger.info(f"💾 Đã lưu {debug_filename}")
+    else:
+        logger.debug(f"❌ Không tìm thấy (độ tin cậy tốt nhất={best_val:.4f} < ngưỡng={threshold})")
+
+        # Debug visualization cho failed match
+        if debug and best_match:
+            debug_img = screen_bgr.copy()
+            top_left, w, h = best_match
+            cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (0, 0, 255), 3)
+
+            text = f"LOW: {best_val:.3f} | Scale: {best_scale:.2f}"
+            cv2.putText(debug_img, text, (top_left[0], top_left[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            debug_filename = f"debug_{os.path.basename(template_path).split('.')[0]}_failed.png"
+            cv2.imwrite(debug_filename, debug_img)
+            logger.info(f"💾 Đã lưu {debug_filename}")
+    
+    return result
 
 # ============================================
-# ANTI-DETECTION: Optimized Functions
-# ============================================
-
-def random_sleep(min_sec=0.2, max_sec=0.5):
-    """Ngủ ngẫu nhiên - ULTRA FAST"""
-    time.sleep(random.uniform(min_sec, max_sec))
-
-def add_random_offset(x, y, max_offset=3):
-    """Thêm độ lệch ngẫu nhiên"""
-    return x + random.randint(-max_offset, max_offset), y + random.randint(-max_offset, max_offset)
-
-def simulate_human_delay():
-    """Delay cực ngắn 10-30ms"""
-    time.sleep(random.uniform(0.01, 0.03))
-
-# ============================================
-# ADB Functions - Optimized
+# HÀM ADB
 # ============================================
 
 def adb_screencap_bytes():
-    """Chụp ảnh màn hình"""
+    """Chụp ảnh màn hình qua ADB"""
     p = subprocess.run(["adb", "exec-out", "screencap", "-p"], stdout=subprocess.PIPE)
     if p.returncode != 0:
-        raise RuntimeError("adb screencap failed")
+        raise RuntimeError("adb chụp màn hình thất bại")
     return p.stdout
 
 def adb_tap(x, y, randomize=True):
-    """Tap với invalidate buffer"""
+    """Tap với random offset"""
     if randomize:
-        x, y = add_random_offset(x, y, max_offset=5)
+        x += random.randint(-5, 5)
+        y += random.randint(-5, 5)
     
-    simulate_human_delay()
+    time.sleep(random.uniform(0.01, 0.03))
     subprocess.run(["adb", "shell", "input", "tap", str(int(x)), str(int(y))])
-    logger.info(f"Tap ({int(x)}, {int(y)})")
-    
-    # Invalidate screenshot buffer sau khi tap
+    logger.info(f"👆 Chạm tại ({int(x)}, {int(y)})")
     _screenshot_buffer.invalidate()
 
 def adb_swipe(x1, y1, x2, y2, duration_ms=200, randomize=True):
-    """Swipe với invalidate buffer"""
+    """Swipe với random offset"""
     if randomize:
-        x1, y1 = add_random_offset(x1, y1)
-        x2, y2 = add_random_offset(x2, y2)
+        x1 += random.randint(-3, 3)
+        y1 += random.randint(-3, 3)
+        x2 += random.randint(-3, 3)
+        y2 += random.randint(-3, 3)
     
     subprocess.run(["adb", "shell", "input", "swipe", 
                     str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)), str(int(duration_ms))])
+    logger.info(f"👉 Vuốt ({int(x1)}, {int(y1)}) -> ({int(x2)}, {int(y2)})")
     _screenshot_buffer.invalidate()
 
 def adb_back():
     """Back button"""
-    simulate_human_delay()
+    time.sleep(random.uniform(0.01, 0.03))
     subprocess.run(["adb", "shell", "input", "keyevent", "BACK"])
+    logger.info("⬅️  Quay lại")
     _screenshot_buffer.invalidate()
 
 # ============================================
-# Screenshot Functions - Cached
+# HÀM CHỤP MÀN HÌNH
 # ============================================
 
 def load_screenshot_bgr(use_cache=True, force_refresh=False):
-    """
-    Load screenshot với caching thông minh
-    - use_cache=True: Dùng buffer nếu còn fresh
-    - force_refresh=True: Bắt buộc capture mới
-    """
+    """Load screenshot với caching"""
     if not use_cache:
         data = adb_screencap_bytes()
         img = Image.open(io.BytesIO(data))
@@ -184,100 +289,77 @@ def load_screenshot_bgr(use_cache=True, force_refresh=False):
     return _screenshot_buffer.get(force_refresh=force_refresh)
 
 # ============================================
-# Template Matching - Ultra Optimized
-# ============================================
-
-def match_template_fast(screen_bgr, template_path, threshold=0.6):
-    """
-    Template matching CỰC NHANH với pre-computed scales
-    Trả về (best_match, best_val) hoặc (None, 0)
-    """
-    scaled_templates = _template_cache.get(template_path)
-    if scaled_templates is None:
-        return None, 0
-    
-    best_match = None
-    best_val = 0
-    
-    # Match với tất cả pre-computed scales
-    for template, scale in scaled_templates:
-        result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        
-        if max_val > best_val:
-            best_val = max_val
-            h, w = template.shape[:2]
-            best_match = (max_loc, w, h, scale)
-        
-        # Early exit nếu đã tìm thấy match rất tốt
-        if max_val > 0.85:
-            break
-    
-    if best_val < threshold:
-        return None, best_val
-    
-    return best_match, best_val
-
-# ============================================
-# High-level Functions - Optimized
+# HÀM CẤP CAO - Phiên bản đa tỉ lệ
 # ============================================
 
 def click_task_title(screen_bgr=None, max_attempts=2, debug=False, 
                      template_path=r"./templates/item_nv.jpg"):
     """
-    Click tiêu đề nhiệm vụ - ULTRA OPTIMIZED
-    - Nhận screen_bgr từ bên ngoài để tránh capture lại
-    - Sử dụng pre-computed templates
+    Click tiêu đề nhiệm vụ - PHIÊN BẢN ĐA TỈ LỆ
     """
-    logger.info("🔍 Tìm tiêu đề...")
+    logger.info("🔍 Tìm tiêu đề nhiệm vụ...")
     
     time.sleep(random.uniform(0.05, 0.15))
     
-    # Dùng screen đã có hoặc load mới
     if screen_bgr is None:
         screen_bgr = load_screenshot_bgr(use_cache=True)
     
     for attempt in range(max_attempts):
         try:
-            best_match, best_val = match_template_fast(screen_bgr, template_path)
+            # Dùng scales tùy chỉnh cho item_nv
+            scales = TEMPLATE_SCALES.get('item_nv', DEFAULT_SCALES)
             
-            if best_match:
-                top_left, w, h, scale = best_match
-                
+            result = match_template_multiscale(
+                screen_bgr, template_path, 
+                threshold=0.6, 
+                scales=scales,
+                debug=debug
+            )
+            
+            if result['found']:
+                center_x, center_y = result['location']
+
+                # Áp dụng offset đặc biệt cho tiêu đề
                 offset_left = 110
-                click_x = top_left[0] + w // 2 - offset_left
-                click_y = top_left[1] + int(h * 0.35)
-                
-                logger.info(f"✅ Found (conf={best_val:.2f}) -> ({click_x}, {click_y})")
-                
-                if debug:
-                    debug_img = screen_bgr.copy()
-                    cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (255,0,255), 2)
-                    cv2.circle(debug_img, (int(click_x), int(click_y)), 8, (0,0,255), -1)
-                    cv2.imwrite('debug_click_task.png', debug_img)
-                    return True
-                
-                adb_tap(click_x, click_y, randomize=True)
+                click_x = center_x - offset_left
+                click_y = result['bbox'][1] + int(result['bbox'][3] * 0.35)
+
+                logger.info(f"✅ Tiêu đề đã tìm thấy (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+                logger.info(f"👆 Nhấn tại ({click_x}, {click_y})")
+
+                if not debug:
+                    adb_tap(click_x, click_y, randomize=True)
+
                 return True
-            
-            logger.debug(f"Not found (attempt {attempt+1}, conf={best_val:.2f})")
-                
+
+            logger.debug(f"Lần thử thứ {attempt+1}/{max_attempts} không thành công")
+
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed: {e}")
+            logger.error(f"Lỗi ở lần thử thứ {attempt+1}: {e}")
         
         if attempt < max_attempts - 1:
             time.sleep(random.uniform(0.1, 0.2))
-            # Refresh screenshot cho attempt tiếp theo
             screen_bgr = load_screenshot_bgr(force_refresh=True)
     
+    logger.error("❌ Không tìm thấy tiêu đề nhiệm vụ!")
     return False
 
 def click_confirm_button(screen_bgr=None, max_attempts=2, debug=False,
                          template_path=r"./templates/btn_xacnhan.jpg"):
     """
-    Click nút xác nhận - ULTRA OPTIMIZED
+    Click vào nút xác nhận - PHIÊN BẢN ĐA TỈ LỆ
+    
+    Args:
+        screen_bgr: Ảnh màn hình dạng BGR (numpy array), nếu None sẽ chụp ảnh mới
+        max_attempts: Số lần thử tối đa (mặc định: 2)
+        debug: Chế độ debug - lưu ảnh debug thay vì click (mặc định: False)
+        template_path: Đường dẫn đến ảnh template nút xác nhận
+        
+    Returns:
+        True nếu tìm thấy và click thành công
+        False nếu không tìm thấy hoặc có lỗi
     """
-    logger.info("🔍 Tìm nút xác nhận...")
+    logger.info("🔍 Đang tìm nút xác nhận...")
     
     time.sleep(random.uniform(0.05, 0.1))
     
@@ -286,360 +368,186 @@ def click_confirm_button(screen_bgr=None, max_attempts=2, debug=False,
     
     for attempt in range(max_attempts):
         try:
-            best_match, best_val = match_template_fast(screen_bgr, template_path)
+            scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
             
-            if best_match:
-                top_left, w, h, scale = best_match
-                click_x = top_left[0] + w // 2
-                click_y = top_left[1] + h // 2
+            result = match_template_multiscale(
+                screen_bgr, template_path,
+                threshold=0.65,
+                scales=scales,
+                debug=debug
+            )
+            
+            if result['found']:
+                click_x, click_y = result['location']
                 
-                logger.info(f"✅ Found (conf={best_val:.2f}) -> ({click_x}, {click_y})")
-                
-                if debug:
-                    debug_img = screen_bgr.copy()
-                    cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (255,0,255), 2)
-                    cv2.circle(debug_img, (int(click_x), int(click_y)), 8, (0,0,255), -1)
-                    cv2.imwrite('debug_click_confirm.png', debug_img)
-                    return True
-                
-                adb_tap(click_x, click_y, randomize=True)
+                logger.info(f"✅ Nút xác nhận đã tìm thấy (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+
+                if not debug:
+                    adb_tap(click_x, click_y, randomize=True)
+
                 return True
             
-            logger.debug(f"Not found (attempt {attempt+1}, conf={best_val:.2f})")
-                
+            logger.debug(f"Lần thử thứ {attempt+1}/{max_attempts} không thành công")
+            
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed: {e}")
+            logger.error(f"Lỗi ở lần thử thứ {attempt+1}: {e}")
         
         if attempt < max_attempts - 1:
             time.sleep(random.uniform(0.1, 0.15))
             screen_bgr = load_screenshot_bgr(force_refresh=True)
-
+    
     logger.error("❌ Không tìm thấy nút xác nhận!")
     return False
 
 def check_btn_xn(screen_bgr=None, threshold=0.7, 
                  template_path=r"./templates/btn_xacnhan.jpg", debug=False):
     """
-    Kiểm tra button - ULTRA FAST
+    Kiểm tra nút xác nhận có hiện không - MULTI-SCALE VERSION
     """
     if screen_bgr is None:
         screen_bgr = load_screenshot_bgr(use_cache=True)
     
-    try:
-        best_match, best_val = match_template_fast(screen_bgr, template_path, threshold)
-        
-        if best_match:
-            logger.info(f"✅ Button found (conf={best_val:.2f})")
-            
-            if debug:
-                debug_img = screen_bgr.copy()
-                top_left, w, h, scale = best_match
-                cv2.rectangle(debug_img, top_left, (top_left[0] + w, top_left[1] + h), (0,255,0), 2)
-                cv2.imwrite('debug_check_btn_xn.png', debug_img)
-            
-            return True
-        else:
-            logger.debug(f"Button not found (conf={best_val:.2f})")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error checking button: {e}")
+    scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+    
+    result = match_template_multiscale(
+        screen_bgr, template_path,
+        threshold=threshold,
+        scales=scales,
+        debug=debug
+    )
+    
+    if result['found']:
+        logger.info(f"✅ Nút xác nhận đã tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    else:
         return False
 
 def check_captra(screen_bgr=None, threshold=0.5, 
                  template_path=r"./templates/captra.jpg", debug=False):
     """
-    Kiểm tra button captra - Tự động thử nhiều scale để phù hợp với zoom level
+    Kiểm tra captcha - PHIÊN BẢN ĐA TỈ LỆ
     """
-    logger.info(f"🔍 check_captra() called with threshold={threshold}")
+    logger.info(f"🔍 Đang kiểm tra captcha (ngưỡng={threshold})...")
     
     if screen_bgr is None:
-        logger.info("📸 Loading screenshot...")
         screen_bgr = load_screenshot_bgr(use_cache=True)
     
-    try:
-        # Kiểm tra kích thước screen
-        screen_h, screen_w = screen_bgr.shape[:2]
-        logger.info(f"📺 Screen size: {screen_w}x{screen_h}")
-        
-        logger.info(f"📂 Loading template: {template_path}")
-        template_original = cv2.imread(template_path)
-        
-        if template_original is None:
-            logger.error(f"❌ Không đọc được template: {template_path}")
-            return False
-        
-        temp_h, temp_w = template_original.shape[:2]
-        logger.info(f"🖼️ Template size: {temp_w}x{temp_h}")
-        
-        # ĐÂY LÀ PHẦN QUAN TRỌNG: Thử nhiều scale từ 50% đến 150%
-        scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
-        
-        best_val = 0
-        best_match = None
-        best_scale = 1.0
-        
-        logger.info(f"🔄 Đang thử {len(scales)} scales khác nhau...")
-        
-        for scale in scales:
-            # Resize template
-            new_w = int(temp_w * scale)
-            new_h = int(temp_h * scale)
-            
-            # Bỏ qua nếu template lớn hơn màn hình
-            if new_w > screen_w or new_h > screen_h:
-                logger.debug(f"⏭️ Skip scale {scale:.2f} (quá lớn: {new_w}x{new_h})")
-                continue
-            
-            # Resize template
-            template = cv2.resize(template_original, (new_w, new_h), 
-                                 interpolation=cv2.INTER_LINEAR)
-            
-            # Match template
-            result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            
-            logger.debug(f"📏 Scale {scale:.2f} ({new_w}x{new_h}) -> conf={max_val:.4f}")
-            
-            # Cập nhật best match
-            if max_val > best_val:
-                best_val = max_val
-                best_match = (max_loc, new_w, new_h)
-                best_scale = scale
-                
-                # Early exit nếu tìm thấy match rất tốt
-                if max_val > 0.9:
-                    logger.info(f"⚡ Tìm thấy match tốt sớm tại scale {scale:.2f}")
-                    break
-        
-        logger.info(f"📊 Best match: conf={best_val:.4f} at scale={best_scale:.2f} (threshold: {threshold})")
-        
-        # Kiểm tra threshold
-        if best_val >= threshold:
-            logger.info(f"✅ Button found! (confidence={best_val:.4f}, scale={best_scale:.2f})")
-            
-            if debug and best_match:
-                debug_img = screen_bgr.copy()
-                top_left, w, h = best_match
-                
-                # Vẽ khung
-                cv2.rectangle(debug_img, top_left, 
-                            (top_left[0] + w, top_left[1] + h), (0, 255, 0), 3)
-                
-                # Vẽ text
-                text = f"Conf: {best_val:.2f} | Scale: {best_scale:.2f}"
-                cv2.putText(debug_img, text, 
-                           (top_left[0], top_left[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                cv2.imwrite('debug_check_captra.png', debug_img)
-                logger.info("💾 Đã lưu debug_check_captra.png")
-            
-            return True
-        else:
-            logger.warning(f"❌ Button not found (best conf={best_val:.4f} < {threshold})")
-            
-            if debug and best_match:
-                # Vẫn lưu ảnh debug để xem
-                debug_img = screen_bgr.copy()
-                top_left, w, h = best_match
-                
-                cv2.rectangle(debug_img, top_left, 
-                            (top_left[0] + w, top_left[1] + h), (0, 0, 255), 3)
-                
-                text = f"LOW: {best_val:.2f} | Scale: {best_scale:.2f}"
-                cv2.putText(debug_img, text, 
-                           (top_left[0], top_left[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                cv2.imwrite('debug_check_captra.png', debug_img)
-                logger.info("💾 Đã lưu debug_check_captra.png (not found)")
-            
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ Error checking button: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+    scales = TEMPLATE_SCALES.get('captra', DEFAULT_SCALES)
+    
+    result = match_template_multiscale(
+        screen_bgr, template_path,
+        threshold=threshold,
+        scales=scales,
+        early_exit_conf=0.9,
+        debug=debug
+    )
+    
+    if result['found']:
+        logger.info(f"✅ Đã phát hiện captcha! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    else:
+        logger.info(f"❌ Không tìm thấy captcha (độ tin cậy tốt nhất={result['confidence']:.3f})")
         return False
 
+# ============================================
+# HÀM TRỢ GIÚP: Hàm kiểm tra tổng quát
+# ============================================
 
-# Nếu muốn tích hợp vào TemplateCache để tăng tốc
-def check_captra_cached(screen_bgr=None, threshold=0.5, 
-                        template_path=r"./templates/captra.jpg", debug=False):
+def check_template(template_path, screen_bgr=None, threshold=0.6, 
+                   scales=None, debug=False, template_name=None):
     """
-    Version dùng cache - nhanh hơn nếu gọi nhiều lần
-    Sử dụng TemplateCache với nhiều scales tùy chỉnh
+    🎯 Hàm tổng quát để kiểm tra bất kỳ template nào
+    
+    Usage:
+        check_template("./templates/button.jpg", threshold=0.7)
     """
-    logger.info(f"🔍 check_captra_cached() called with threshold={threshold}")
+    if template_name is None:
+        template_name = os.path.basename(template_path)
+    
+    logger.info(f"🔍 Đang kiểm tra {template_name} (ngưỡng={threshold})...")
     
     if screen_bgr is None:
-        logger.info("📸 Loading screenshot...")
         screen_bgr = load_screenshot_bgr(use_cache=True)
     
-    try:
-        # Kiểm tra kích thước screen
-        screen_h, screen_w = screen_bgr.shape[:2]
-        logger.info(f"📺 Screen size: {screen_w}x{screen_h}")
-        
-        # Định nghĩa scales phù hợp
-        scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
-        
-        # Lấy scaled templates từ cache
-        scaled_templates = _template_cache.get(template_path, scales=scales)
-        
-        if scaled_templates is None:
-            logger.error(f"❌ Không đọc được template: {template_path}")
-            return False
-        
-        best_val = 0
-        best_match = None
-        best_scale = 1.0
-        
-        logger.info(f"🔄 Đang thử {len(scales)} scales khác nhau...")
-        
-        # Match với tất cả pre-computed scales
-        for template, scale in scaled_templates:
-            h, w = template.shape[:2]
-            
-            # Bỏ qua nếu template lớn hơn màn hình
-            if w > screen_w or h > screen_h:
-                logger.debug(f"⏭️ Skip scale {scale:.2f} (quá lớn: {w}x{h})")
-                continue
-            
-            # Match template
-            result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            
-            logger.debug(f"🔍 Scale {scale:.2f} ({w}x{h}) -> conf={max_val:.4f}")
-            
-            # Cập nhật best match
-            if max_val > best_val:
-                best_val = max_val
-                best_match = (max_loc, w, h)
-                best_scale = scale
-                
-                # Early exit nếu tìm thấy match rất tốt
-                if max_val > 0.9:
-                    logger.info(f"⚡ Tìm thấy match tốt sớm tại scale {scale:.2f}")
-                    break
-        
-        logger.info(f"📊 Best match: conf={best_val:.4f} at scale={best_scale:.2f} (threshold: {threshold})")
-        
-        # Kiểm tra threshold
-        if best_val >= threshold:
-            logger.info(f"✅ Button found! (confidence={best_val:.4f}, scale={best_scale:.2f})")
-            
-            if debug and best_match:
-                debug_img = screen_bgr.copy()
-                top_left, w, h = best_match
-                
-                # Vẽ khung
-                cv2.rectangle(debug_img, top_left, 
-                            (top_left[0] + w, top_left[1] + h), (0, 255, 0), 3)
-                
-                # Vẽ text
-                text = f"Conf: {best_val:.2f} | Scale: {best_scale:.2f}"
-                cv2.putText(debug_img, text, 
-                           (top_left[0], top_left[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                cv2.imwrite('debug_check_captra_cached.png', debug_img)
-                logger.info("💾 Đã lưu debug_check_captra_cached.png")
-            
-            return True
-        else:
-            logger.warning(f"❌ Button not found (best conf={best_val:.4f} < {threshold})")
-            
-            if debug and best_match:
-                # Vẫn lưu ảnh debug để xem
-                debug_img = screen_bgr.copy()
-                top_left, w, h = best_match
-                
-                cv2.rectangle(debug_img, top_left, 
-                            (top_left[0] + w, top_left[1] + h), (0, 0, 255), 3)
-                
-                text = f"LOW: {best_val:.2f} | Scale: {best_scale:.2f}"
-                cv2.putText(debug_img, text, 
-                           (top_left[0], top_left[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                cv2.imwrite('debug_check_captra_cached.png', debug_img)
-                logger.info("💾 Đã lưu debug_check_captra_cached.png (not found)")
-            
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ Error checking button: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-# ============================================
-# Legacy Functions (kept for compatibility)
-# ============================================
-
-def find_text_ocr(screen_bgr, text_list, conf_thresh=40, lang="rus"):
-    """OCR - kept for compatibility"""
-    rgb = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(rgb)
+    result = match_template_multiscale(
+        screen_bgr, template_path,
+        threshold=threshold,
+        scales=scales or DEFAULT_SCALES,
+        debug=debug
+    )
     
-    config = "--psm 6"
-    if lang:
-        config += f" -l {lang}"
+    if result['found']:
+        logger.info(f"✅ {template_name} đã được tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+    else:
+        logger.info(f"❌ {template_name} không tìm thấy (độ tin cậy tốt nhất={result['confidence']:.3f})")
     
-    try:
-        data = pytesseract.image_to_data(pil, output_type=pytesseract.Output.DICT, config=config)
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        return None
-    
-    n = len(data['text'])
-    for i in range(n):
-        txt = str(data['text'][i]).strip()
-        conf = -1
-        try:
-            conf = int(float(data['conf'][i]))
-        except:
-            pass
-        
-        if conf >= conf_thresh:
-            for search_text in text_list:
-                if search_text.lower() in txt.lower():
-                    x = int(data['left'][i] + data['width'][i]/2)
-                    y = int(data['top'][i] + data['height'][i]/2)
-                    return {'center': (x, y), 'conf': conf, 'text': txt, 'matched': search_text}
-    
-    return None
+    return result
 
 # ============================================
-# Initialization
+# KHỞI TẠO
 # ============================================
 
-# Pre-load templates khi import module
+def preload_templates():
+    """Pre-load tất cả templates vào cache"""
+    templates = {
+        'item_nv': (r"./templates/item_nv.jpg", TEMPLATE_SCALES.get('item_nv')),
+        'btn_xacnhan': (r"./templates/btn_xacnhan.jpg", TEMPLATE_SCALES.get('btn_xacnhan')),
+        'captra': (r"./templates/captra.jpg", TEMPLATE_SCALES.get('captra')),
+    }
+    
+    logger.info("🔄 Pre-loading templates...")
+    for name, (path, scales) in templates.items():
+        if os.path.exists(path):
+            _template_cache.get(path, scales=scales)
+    logger.info("✅ Đã nạp trước tất cả templates!")
+
+# Pre-load khi import module
 try:
     preload_templates()
 except Exception as e:
-    logger.warning(f"Could not preload templates: {e}")
+    logger.warning(f"Không thể nạp trước templates: {e}")
+
+# ============================================
+# MAIN TEST
+# ============================================
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🚀 STARTING TEST")
-    print("=" * 50)
+    print("=" * 60)
+    print("🚀 KIỂM TRA TÌM KIẾM TEMPLATE ĐA TỈ LỆ")
+    print("=" * 60)
     
     try:
+        # Load screenshot
         screen = load_screenshot_bgr()
-        print(f"✅ Screenshot loaded: {screen.shape}")
+        print(f"✅ Đã tải ảnh màn hình: {screen.shape}")
         
-        print("\n🔍 Running check_captra...")
-        if check_captra_cached(screen, debug=True):
-            print("✅ Test OK!")
-        else:
-            print("❌ Test FAILED!")
+        # Test 1: Check captcha
+        print("\n📋 Test 1: Kiểm tra Captcha")
+        print("-" * 60)
+        check_captra(screen, threshold=0.5, debug=True)
+        
+        # Test 2: Check button xác nhận
+        print("\n📋 Test 2: Kiểm tra nút Xác Nhận")
+        print("-" * 60)
+        check_btn_xn(screen, threshold=0.7, debug=True)
+        
+        # Test 3: Generic check
+        print("\n📋 Test 3: Kiểm tra tổng quát")
+        print("-" * 60)
+        result = check_template(
+            "./templates/captra.jpg",
+            screen_bgr=screen,
+            threshold=0.5,
+            debug=True,
+            template_name="Nút Captcha"
+        )
+        print(f"Kết quả: {result}")
+        
+        print("\n" + "=" * 60)
+        print("✅ ĐÃ HOÀN THÀNH TẤT CẢ BÀI KIỂM TRA!")
+        print("=" * 60)
+        
     except Exception as e:
-        print(f"❌ ERROR: {e}")
+        print(f"\n❌ LỖI: {e}")
         import traceback
         traceback.print_exc()
-    
-    print("=" * 50)
-    print("🏁 TEST FINISHED")
-    print("=" * 50)
