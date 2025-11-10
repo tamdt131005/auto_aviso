@@ -11,6 +11,12 @@ try:
         click_confirm_button,
         check_btn_xn,
         check_captra,
+        adb_back,
+        check_btn_start_video,
+        click_start_video,
+        check_time_cho,
+        check_nv,
+        scroll_up,
         logger,
         _screenshot_buffer
     )
@@ -37,10 +43,24 @@ CONFIG = {
     'max_count': 50,                    # Tổng số nhiệm vụ cần hoàn thành
     'break_interval': 25,               # Nghỉ sau mỗi N nhiệm vụ
     'break_duration': (2, 5),           # Thời gian nghỉ (min, max)
-    'captcha_timeout': 60,              # Thiời gian tối đa chờ captcha được giải (giây)
+    'captcha_timeout': 60,              # Thời gian tối đa chờ captcha được giải (giây)
     'captcha_check_interval': 2,        # Khoảng kiểm tra captcha (giây)
-    'button_wait_max': 15,              # Thời gian tố đa chờ nút xuất hiện (giây)
-    'button_check_intervals': [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 4.0],  # Các khoảng chờ tăng dần
+    
+    # Chiến lược chờ cho nhiệm vụ thường (ngắn)
+    'button_wait_max': 15,              # Thời gian tối đa chờ nút xuất hiện (giây)
+    'button_check_intervals': [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 4.0],
+    
+    # Chiến lược chờ cho nhiệm vụ dài (video)
+    'long_task_button_wait_max': 180,   # Thời gian tối đa chờ nút (3 phút)
+    'long_task_check_intervals': [
+        # 30 giây đầu: check mỗi 2s (15 lần)
+        *[2.0] * 15,
+        # 60 giây tiếp: check mỗi 3s (20 lần) 
+        *[3.0] * 20,
+        # 90 giây cuối: check mỗi 5s (18 lần)
+        *[5.0] * 18
+    ],  # Tổng: 30 + 60 + 90 = 180s
+    
     'page_load_delay': (3.5, 4.5),      # Chờ load trang (min, max)
     'post_captcha_delay': (1.0, 2.0),   # Delay sau khi captcha được giải
     'inter_action_delay': (0.5, 0.25),  # Delay giữa các hành động (cơ bản, biến thiên)
@@ -144,36 +164,70 @@ def wait_and_solve_captcha(max_wait=60, check_interval=2):
 # BUTTON WAITING
 # ============================================
 
-def wait_for_button(check_intervals=None, threshold=0.7):
+def wait_for_button(check_intervals=None, threshold=0.7, is_long_task=False):
     """
     Chờ nút xác nhận xuất hiện với kiểm tra tăng dần
 
+    Args:
+        check_intervals: Danh sách khoảng thời gian kiểm tra
+        threshold: Ngưỡng so khớp template
+        is_long_task: True nếu là nhiệm vụ dài (video)
+    
     Trả về:
         (found, screen, wait_time) tuple
     """
     if check_intervals is None:
-        check_intervals = CONFIG['button_check_intervals']
+        if is_long_task:
+            check_intervals = CONFIG['long_task_check_intervals']
+        else:
+            check_intervals = CONFIG['button_check_intervals']
     
-    logger.info("🔍 Đang chờ nút xác nhận...")
+    task_type = "nhiệm vụ DÀI (video)" if is_long_task else "nhiệm vụ thường"
+    max_time = sum(check_intervals)
+    
+    logger.info(f"🔍 Đang chờ nút xác nhận ({task_type}, tối đa {max_time:.0f}s)...")
     
     total_waited = 0
+    milestone_25 = False
+    milestone_60 = False
+    milestone_120 = False
     
     for idx, interval in enumerate(check_intervals):
         # Nghỉ
         time.sleep(interval)
         total_waited += interval
         
+        # Hiển thị milestone cho nhiệm vụ dài
+        if is_long_task:
+            if total_waited >= 25 and not milestone_25:
+                logger.info(f"⏱️  [Milestone] Đã chờ 25s...")
+                milestone_25 = True
+            elif total_waited >= 60 and not milestone_60:
+                logger.info(f"⏱️  [Milestone] Đã chờ 1 phút...")
+                milestone_60 = True
+            elif total_waited >= 120 and not milestone_120:
+                logger.info(f"⏱️  [Milestone] Đã chờ 2 phút...")
+                milestone_120 = True
+        
         # Chụp ảnh mới
         screen = load_screenshot_bgr(force_refresh=True)
         
         # Kiểm tra nút
         if check_btn_xn(screen_bgr=screen, threshold=threshold, debug=False):
-            logger.info(f"✅ Đã tìm thấy nút sau {total_waited:.1f}s!")
+            logger.info(f"✅ Đã tìm thấy nút sau {total_waited:.1f}s! ({task_type})")
             return True, screen, total_waited
         
-        logger.debug(f"⏳ Chưa có... ({total_waited:.1f}s đã chờ, lần thử {idx+1}/{len(check_intervals)})")
+        # Log tiến độ
+        remaining = max_time - total_waited
+        if is_long_task:
+            # Với nhiệm vụ dài, chỉ log mỗi 10s
+            if idx % 5 == 0 or remaining < 10:
+                logger.debug(f"⏳ Vẫn đang chờ... ({total_waited:.0f}s/{max_time:.0f}s, còn {remaining:.0f}s)")
+        else:
+            # Với nhiệm vụ ngắn, log bình thường
+            logger.debug(f"⏳ Chưa có... ({total_waited:.1f}s đã chờ, lần thử {idx+1}/{len(check_intervals)})")
     
-    logger.warning(f"⏱️  Hết thời gian chờ nút sau {total_waited:.1f}s")
+    logger.warning(f"⏱️  Hết thời gian chờ nút sau {total_waited:.1f}s ({task_type})")
     return False, None, total_waited
 
 # ============================================
@@ -185,8 +239,10 @@ class Stats:
         self.success_count = 0
         self.fail_count = 0
         self.captcha_count = 0
+        self.long_task_count = 0  # Đếm số lần gặp nhiệm vụ dài
         self.start_time = time.time()
         self.button_wait_times = []
+        self.long_task_wait_times = []  # Riêng cho nhiệm vụ dài
     
     def record_success(self):
         self.success_count += 1
@@ -197,8 +253,13 @@ class Stats:
     def record_captcha(self):
         self.captcha_count += 1
     
-    def record_button_wait(self, wait_time):
+    def record_long_task(self):
+        self.long_task_count += 1
+    
+    def record_button_wait(self, wait_time, is_long_task=False):
         self.button_wait_times.append(wait_time)
+        if is_long_task:
+            self.long_task_wait_times.append(wait_time)
     
     def get_elapsed(self):
         return time.time() - self.start_time
@@ -225,6 +286,11 @@ class Stats:
             return 0
         return sum(self.button_wait_times) / len(self.button_wait_times)
     
+    def get_avg_long_task_wait(self):
+        if not self.long_task_wait_times:
+            return 0
+        return sum(self.long_task_wait_times) / len(self.long_task_wait_times)
+    
     def print_progress(self, current, target):
         elapsed = self.get_elapsed()
         avg_time = self.get_avg_time()
@@ -232,13 +298,17 @@ class Stats:
         rate = self.get_rate()
         
         logger.info(f"✅ Đã hoàn thành {current}/{target}")
-        logger.info(f"📊 Thành công: {self.success_count} | Thất bại: {self.fail_count} | Captcha: {self.captcha_count}")
+        logger.info(f"📊 Thành công: {self.success_count} | Thất bại: {self.fail_count} | Captcha: {self.captcha_count} | Video: {self.long_task_count}")
         logger.info(f"⚡ Tốc độ: {rate:.1f}/phút | Trung bình: {avg_time:.1f}s/nhiệm vụ")
         logger.info(f"🕐 Đã chạy: {format_time(elapsed)} | ETA: {format_time(remaining)}")
         
         if self.button_wait_times:
             avg_btn_wait = self.get_avg_button_wait()
             logger.info(f"⏱️  Thời gian chờ nút trung bình: {avg_btn_wait:.1f}s")
+            
+            if self.long_task_wait_times:
+                avg_long_wait = self.get_avg_long_task_wait()
+                logger.info(f"🎥 Thời gian chờ nhiệm vụ dài trung bình: {avg_long_wait:.1f}s")
     
     def print_final(self, target):
         total_time = self.get_elapsed()
@@ -249,6 +319,7 @@ class Stats:
         logger.info(f"✅ Thành công: {self.success_count}/{target}")
         logger.info(f"❌ Thất bại: {self.fail_count}")
         logger.info(f"🔒 Số lần gặp captcha: {self.captcha_count}")
+        logger.info(f"🎥 Số lần gặp nhiệm vụ dài: {self.long_task_count}")
         logger.info(f"⏱️  Tổng thời gian: {format_time(total_time)}")
         
         if self.success_count > 0:
@@ -264,11 +335,21 @@ class Stats:
                 captcha_rate = (self.captcha_count / target) * 100
                 logger.info(f"🔒 Tỉ lệ captcha: {captcha_rate:.1f}%")
             
+            if self.long_task_count > 0:
+                long_task_rate = (self.long_task_count / self.success_count) * 100
+                logger.info(f"🎥 Tỉ lệ nhiệm vụ dài: {long_task_rate:.1f}%")
+            
             if self.button_wait_times:
                 avg_btn_wait = self.get_avg_button_wait()
                 min_wait = min(self.button_wait_times)
                 max_wait = max(self.button_wait_times)
-                logger.info(f"⏱️  Thời gian đợi nút: trung bình={avg_btn_wait:.1f}s, nhỏ nhất={min_wait:.1f}s, lớn nhất={max_wait:.1f}s")
+                logger.info(f"⏱️  Thời gian đợi nút (tổng quát): trung bình={avg_btn_wait:.1f}s, nhỏ nhất={min_wait:.1f}s, lớn nhất={max_wait:.1f}s")
+                
+                if self.long_task_wait_times:
+                    avg_long_wait = self.get_avg_long_task_wait()
+                    min_long_wait = min(self.long_task_wait_times)
+                    max_long_wait = max(self.long_task_wait_times)
+                    logger.info(f"🎥 Thời gian đợi nút (nhiệm vụ dài): trung bình={avg_long_wait:.1f}s, nhỏ nhất={min_long_wait:.1f}s, lớn nhất={max_long_wait:.1f}s")
         
         logger.info(f"{'='*60}")
 
@@ -276,14 +357,11 @@ class Stats:
 # MAIN WORKFLOW
 # ============================================
 
-def execute_single_task(stats):
-    """
-    Execute a single task cycle
-    
-    Returns:
-        True if successful, False if failed
-    """
-    
+def execute_single_task(stats):    
+    is_long_task = False  # Flag để theo dõi loại nhiệm vụ
+    if not check_nv():
+        scroll_up(30)
+        time.sleep(random.uniform(0.5, 1.0))
     # ============================================
     # Step 1: Capture screen and click task
     # ============================================
@@ -295,45 +373,94 @@ def execute_single_task(stats):
         return False
     
     logger.info("✅ Clicked task")
+    time.sleep(random.uniform(2.0, 2.5))
     
     # ============================================
-    # Step 2: Wait for page load & check captcha
+    # Step 1.5: Chụp lại ảnh để kiểm tra loại nhiệm vụ
     # ============================================
-    logger.info("⏱️  Step 2: Waiting for page load & checking captcha...")
+    logger.info("📸 Chụp lại màn hình để kiểm tra loại nhiệm vụ...")
+    screen = load_screenshot_bgr(use_cache=False, force_refresh=True)
     
-    # Wait for page to load
-    page_load_time = random.uniform(*CONFIG['page_load_delay'])
-    time.sleep(page_load_time)
+    # ============================================
+    # Kiểm tra xem nhiệm vụ có dài hay không (tab chrome mới)
+    # ============================================
+    if check_btn_start_video(screen_bgr=screen, debug=False):
+        is_long_task = True  # Đánh dấu là nhiệm vụ dài
+        stats.record_long_task()
+        
+        logger.info("🎥 NHIỆM VỤ DÀI PHÁT HIỆN! Bắt đầu video...")
+        time.sleep(random.uniform(0.4, 1.0))
+        
+        if not click_start_video(screen_bgr=screen, debug=False):
+            logger.warning("⚠️  Không thể nhấn nút bắt đầu video")
+            return False
+        
+        logger.info("✅ Đã nhấn nút bắt đầu video")
+        time.sleep(random.uniform(1.0, 2.0))
+        adb_back()
+        logger.info("✅ Quay lại sau khi bắt đầu video")
+        
+        logger.info("📸 Chụp lại màn hình sau khi back về...")
+        time.sleep(random.uniform(0.5, 1.0))
+        screen = load_screenshot_bgr(use_cache=False, force_refresh=True)
+
+    # ============================================
+    # Step 2: Kiểm tra xem nhiệm vụ có đang chạy hay không
+    # ============================================
     
-    # Check and solve captcha if present
-    if not wait_and_solve_captcha(
-        max_wait=CONFIG['captcha_timeout'],
-        check_interval=CONFIG['captcha_check_interval']
-    ):
-        logger.error("❌ Failed to solve captcha")
-        stats.record_captcha()
-        return False
+    has_time_wait = check_time_cho()
     
-    # If captcha was present and solved, wait for UI refresh
-    if stats.captcha_count > 0:
-        logger.info("⏳ Waiting for UI refresh after captcha...")
-        post_captcha_delay = random.uniform(*CONFIG['post_captcha_delay'])
-        time.sleep(post_captcha_delay)
+    if has_time_wait:
+        logger.info("✅ Phát hiện thời gian chờ, tiếp tục chờ nút xác nhận...")
+    else:
+        logger.info("⏱️  Không có thời gian chờ, kiểm tra captcha...")
     
+        # Wait for page to load
+        page_load_time = random.uniform(*CONFIG['page_load_delay'])
+        time.sleep(page_load_time)
+        
+        # Chụp lại màn hình để kiểm tra captcha
+        screen = load_screenshot_bgr(use_cache=False, force_refresh=True)
+        
+        # Kiểm tra captcha
+        if check_captra(screen, threshold=0.5):
+            logger.warning("🔒 Phát hiện captcha, đang xử lý...")
+            if not wait_and_solve_captcha(
+                max_wait=CONFIG['captcha_timeout'],
+                check_interval=CONFIG['captcha_check_interval']
+            ):
+                logger.error("❌ Failed to solve captcha")
+                stats.record_captcha()
+                return False
+            
+            stats.record_captcha()
+            logger.info("⏳ Waiting for UI refresh after captcha...")
+            post_captcha_delay = random.uniform(*CONFIG['post_captcha_delay'])
+            time.sleep(post_captcha_delay)
+            
+            logger.info("✅ Captcha đã giải, tiếp tục quy trình...")
+        else:
+            logger.info("🔄 Không có captcha và không có thời gian chờ, chạy lại nhiệm vụ...")
+            time.sleep(random.uniform(0.5, 1.0))
+            return execute_single_task(stats)
+        
     # ============================================
     # Step 3: Wait for confirm button
     # ============================================
-    logger.info("🔍 Step 3: Waiting for confirm button...")
+    task_type_label = "nhiệm vụ DÀI (video)" if is_long_task else "nhiệm vụ thường"
+    logger.info(f"🔍 Step 3: Chờ nút xác nhận ({task_type_label})...")
     
+    # Sử dụng chiến lược chờ phù hợp
     btn_found, screen, wait_time = wait_for_button(
-        check_intervals=CONFIG['button_check_intervals']
+        check_intervals=None,  # Sẽ tự chọn dựa vào is_long_task
+        is_long_task=is_long_task
     )
     
     if not btn_found:
-        logger.warning("⏱️  Button timeout")
+        logger.warning(f"⏱️  Button timeout ({task_type_label})")
         return False
     
-    stats.record_button_wait(wait_time)
+    stats.record_button_wait(wait_time, is_long_task=is_long_task)
     
     # Minimal delay before click
     time.sleep(random.uniform(0.05, 0.15))
@@ -366,7 +493,7 @@ def main():
     
     # Print header
     logger.info("=" * 60)
-    logger.info("🚀 ULTRA SPEED AUTOMATION - WITH CAPTCHA HANDLING")
+    logger.info("🚀 ULTRA SPEED AUTOMATION - WITH LONG TASK SUPPORT")
     logger.info("=" * 60)
     logger.info(f"🎯 Target: {max_count} tasks")
     logger.info(f"⚡ Optimizations:")
@@ -376,9 +503,10 @@ def main():
     logger.info(f"   - Ultra-fast delays (10-50ms)")
     logger.info(f"   - Smart captcha detection & handling")
     logger.info(f"   - Progressive button waiting")
+    logger.info(f"   - 🎥 LONG TASK (video) support: up to 3 minutes wait")
     logger.info("=" * 60)
     logger.info("📋 Workflow:")
-    logger.info("   Click task → Check captcha → Wait button → Click confirm")
+    logger.info("   Click task → Check type → Handle video → Check captcha → Wait button → Confirm")
     logger.info("=" * 60)
     
     # Initial delay

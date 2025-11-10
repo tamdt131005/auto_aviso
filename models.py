@@ -16,11 +16,6 @@ import threading
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============================================
-# CẤU HÌNH CHUNG
-# ============================================
-
-# Scales mặc định cho tất cả template matching
 DEFAULT_SCALES = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
 
 # Scales cho các template cụ thể (có thể tùy chỉnh)
@@ -122,26 +117,6 @@ _screenshot_buffer = ScreenshotBuffer(ttl=0.3)
 
 def match_template_multiscale(screen_bgr, template_path, threshold=0.6, 
                               scales=None, early_exit_conf=0.9, debug=False):
-    """
-    🎯 HÀM CHÍNH: Tìm kiếm template đa tỉ lệ
-    
-    Tham số:
-        screen_bgr: Ảnh màn hình dạng BGR
-        template_path: Đường dẫn tới file template
-        threshold: Ngưỡng độ tin cậy (0.0-1.0)
-        scales: Danh sách tỉ lệ cần thử (None = dùng mặc định)
-        early_exit_conf: Ngưỡng để dừng sớm khi tìm thấy match rất tốt
-        debug: Nếu True lưu ảnh debug
-    
-    Trả về:
-        dict: {
-            'found': bool,
-            'confidence': float,
-            'location': (x, y),  # Tọa độ tâm
-            'bbox': (x, y, w, h),
-            'scale': float
-        }
-    """
     result = {
         'found': False,
         'confidence': 0.0,
@@ -243,7 +218,88 @@ def adb_screencap_bytes():
     if p.returncode != 0:
         raise RuntimeError("adb chụp màn hình thất bại")
     return p.stdout
+def get_screen_size():
+    """
+    Lấy kích thước màn hình từ ADB
+    
+    Returns:
+        tuple: (width, height) của màn hình
+    """
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "wm", "size"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Không thể lấy kích thước màn hình: {result.stderr}")
+        
+        # Output: "Physical size: 1080x2400"
+        output = result.stdout.strip()
+        size_str = output.split(":")[-1].strip()  # "1080x2400"
+        width, height = map(int, size_str.split("x"))
+        
+        logger.info(f"📐 Kích thước màn hình: {width}x{height}")
+        return width, height
+        
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timeout khi lấy kích thước màn hình")
+    except ValueError as e:
+        raise RuntimeError(f"Không thể parse kích thước màn hình: {output}")
+    except Exception as e:
+        raise RuntimeError(f"Lỗi không xác định: {e}")
 
+
+# Cache để không phải gọi ADB nhiều lần
+_screen_size_cache = None
+
+def get_screen_size():
+    """
+    Lấy kích thước màn hình từ ADB (có cache)
+    
+    Returns:
+        tuple: (width, height) của màn hình
+    """
+    global _screen_size_cache
+    
+    if _screen_size_cache is not None:
+        return _screen_size_cache
+    
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "wm", "size"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Không thể lấy kích thước màn hình: {result.stderr}")
+        
+        # Output: "Physical size: 1080x2400"
+        output = result.stdout.strip()
+        size_str = output.split(":")[-1].strip()  # "1080x2400"
+        width, height = map(int, size_str.split("x"))
+        
+        _screen_size_cache = (width, height)
+        logger.info(f"📐 Kích thước màn hình: {width}x{height}")
+        return width, height
+        
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timeout khi lấy kích thước màn hình")
+    except ValueError as e:
+        raise RuntimeError(f"Không thể parse kích thước màn hình: {output}")
+    except Exception as e:
+        raise RuntimeError(f"Lỗi không xác định: {e}")
+
+
+def clear_screen_size_cache():
+    """Xóa cache kích thước màn hình (dùng khi đổi device hoặc xoay màn hình)"""
+    global _screen_size_cache
+    _screen_size_cache = None
+    logger.info("🗑️  Đã xóa cache kích thước màn hình")
 def adb_tap(x, y, randomize=True):
     """Tap với random offset"""
     if randomize:
@@ -267,12 +323,55 @@ def adb_swipe(x1, y1, x2, y2, duration_ms=200, randomize=True):
                     str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)), str(int(duration_ms))])
     logger.info(f"👉 Vuốt ({int(x1)}, {int(y1)}) -> ({int(x2)}, {int(y2)})")
     _screenshot_buffer.invalidate()
-
+def scroll_up(scroll_percent=None):
+    """Kéo lên để xem nội dung phía trên (lướt bài viết lên)"""
+    width, height = get_screen_size()
+    
+    x = random.randint(int(width * 0.4), int(width * 0.6))
+    start_y = random.randint(int(height * 0.6), int(height * 0.7))  # Bắt đầu từ dưới
+    
+    if scroll_percent is not None:
+        scroll_distance = (scroll_percent / 100) * height
+        
+        if scroll_percent <= 30:
+            duration = random.randint(200, 300)
+            pause = random.uniform(1.0, 2.0)
+            scroll_type = f"{scroll_percent}%"
+        elif scroll_percent <= 50:
+            duration = random.randint(300, 500)
+            pause = random.uniform(0.5, 1.5)
+            scroll_type = f"{scroll_percent}%"
+        else:
+            duration = random.randint(400, 600)
+            pause = random.uniform(0.3, 0.8)
+            scroll_type = f"{scroll_percent}%"
+    else:
+        scroll_types = ['short', 'medium', 'long']
+        scroll_type = random.choices(scroll_types, weights=[0.3, 0.5, 0.2])[0]
+        
+        if scroll_type == 'short':
+            scroll_distance = random.uniform(0.2, 0.3) * height
+            duration = random.randint(200, 300)
+            pause = random.uniform(1.0, 2.0)
+        elif scroll_type == 'medium':
+            scroll_distance = random.uniform(0.4, 0.6) * height
+            duration = random.randint(300, 500)
+            pause = random.uniform(0.5, 1.5)
+        else:  # long
+            scroll_distance = random.uniform(0.6, 0.8) * height
+            duration = random.randint(400, 600)
+            pause = random.uniform(0.3, 0.8)
+    
+    end_y = int(start_y - scroll_distance)  # ✅ Trừ = kéo lên
+    
+    adb_swipe(x, start_y, x, end_y, duration, randomize=True)
+    time.sleep(pause)
+    logger.info(f"📱 Kéo lên ({scroll_type})")
 def adb_back():
     """Back button"""
     time.sleep(random.uniform(0.01, 0.03))
     subprocess.run(["adb", "shell", "input", "keyevent", "BACK"])
-    logger.info("⬅️  Quay lại")
+    logger.info("⬅️  Quay lại trang trước")
     _screenshot_buffer.invalidate()
 
 # ============================================
@@ -346,19 +445,6 @@ def click_task_title(screen_bgr=None, max_attempts=2, debug=False,
 
 def click_confirm_button(screen_bgr=None, max_attempts=2, debug=False,
                          template_path=r"./templates/btn_xacnhan.jpg"):
-    """
-    Click vào nút xác nhận - PHIÊN BẢN ĐA TỈ LỆ
-    
-    Args:
-        screen_bgr: Ảnh màn hình dạng BGR (numpy array), nếu None sẽ chụp ảnh mới
-        max_attempts: Số lần thử tối đa (mặc định: 2)
-        debug: Chế độ debug - lưu ảnh debug thay vì click (mặc định: False)
-        template_path: Đường dẫn đến ảnh template nút xác nhận
-        
-    Returns:
-        True nếu tìm thấy và click thành công
-        False nếu không tìm thấy hoặc có lỗi
-    """
     logger.info("🔍 Đang tìm nút xác nhận...")
     
     time.sleep(random.uniform(0.05, 0.1))
@@ -398,7 +484,85 @@ def click_confirm_button(screen_bgr=None, max_attempts=2, debug=False,
     
     logger.error("❌ Không tìm thấy nút xác nhận!")
     return False
+def click_start_video(screen_bgr=None, max_attempts=2, debug=False,
+                         template_path=r"./templates/start_video.png"):
+    logger.info("🔍 Đang tìm nút startvideo...")
+    
+    time.sleep(random.uniform(0.05, 0.1))
+    
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    for attempt in range(max_attempts):
+        try:
+            scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+            
+            result = match_template_multiscale(
+                screen_bgr, template_path,
+                threshold=0.65,
+                scales=scales,
+                debug=debug
+            )
+            
+            if result['found']:
+                click_x, click_y = result['location']
+                
+                logger.info(f"✅ Nút xác nhận đã tìm thấy (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
 
+                if not debug:
+                    adb_tap(click_x, click_y, randomize=True)
+
+                return True
+            
+            logger.debug(f"Lần thử thứ {attempt+1}/{max_attempts} không thành công")
+            
+        except Exception as e:
+            logger.error(f"Lỗi ở lần thử thứ {attempt+1}: {e}")
+        
+        if attempt < max_attempts - 1:
+            time.sleep(random.uniform(0.1, 0.15))
+            screen_bgr = load_screenshot_bgr(force_refresh=True)
+    
+    logger.error("❌ Không tìm thấy nút xác nhận!")
+    return False
+def check_nv(screen_bgr=None, threshold=0.7, 
+                 template_path=r"./templates/item_nv.jpg", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+    
+    result = match_template_multiscale(
+        screen_bgr, template_path,
+        threshold=threshold,
+        scales=scales,
+        debug=debug
+    )
+    
+    if result['found']:
+        logger.info(f"Nhiệm Vụ đã được tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    else:
+        return False
+def check_btn_start_video(screen_bgr=None, threshold=0.7, 
+                 template_path=r"./templates/start_video.png", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    scales = TEMPLATE_SCALES.get('btn_xacnhan', DEFAULT_SCALES)
+    
+    result = match_template_multiscale(
+        screen_bgr, template_path,
+        threshold=threshold,
+        scales=scales,
+        debug=debug
+    )
+    
+    if result['found']:
+        logger.info(f"✅ Nút start video đã tìm thấy! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    else:
+        return False
 def check_btn_xn(screen_bgr=None, threshold=0.7, 
                  template_path=r"./templates/btn_xacnhan.jpg", debug=False):
     """
@@ -421,7 +585,25 @@ def check_btn_xn(screen_bgr=None, threshold=0.7,
         return True
     else:
         return False
-
+def check_time_cho(screen_bgr=None, threshold=0.6, 
+                 template_path=r"./templates/time_cho.jpg", debug=False):
+    if screen_bgr is None:
+        screen_bgr = load_screenshot_bgr(use_cache=True)
+    
+    scales = TEMPLATE_SCALES.get('item_nv', DEFAULT_SCALES)
+    
+    result = match_template_multiscale(
+        screen_bgr, template_path,
+        threshold=threshold,
+        scales=scales,
+        debug=debug
+    )
+    
+    if result['found']:
+        logger.info(f"✅ Xác nhận đang chạy nhiệm vụ! (độ tin cậy={result['confidence']:.3f}, tỉ lệ={result['scale']:.2f})")
+        return True
+    else:
+        return False    
 def check_captra(screen_bgr=None, threshold=0.5, 
                  template_path=r"./templates/captra.jpg", debug=False):
     """
@@ -518,35 +700,13 @@ if __name__ == "__main__":
     
     try:
         # Load screenshot
-        screen = load_screenshot_bgr()
+        screen = load_screenshot_bgr(use_cache=False, force_refresh=True)
         print(f"✅ Đã tải ảnh màn hình: {screen.shape}")
         
         # Test 1: Check captcha
         print("\n📋 Test 1: Kiểm tra Captcha")
         print("-" * 60)
-        check_captra(screen, threshold=0.5, debug=True)
-        
-        # Test 2: Check button xác nhận
-        print("\n📋 Test 2: Kiểm tra nút Xác Nhận")
-        print("-" * 60)
-        check_btn_xn(screen, threshold=0.7, debug=True)
-        
-        # Test 3: Generic check
-        print("\n📋 Test 3: Kiểm tra tổng quát")
-        print("-" * 60)
-        result = check_template(
-            "./templates/captra.jpg",
-            screen_bgr=screen,
-            threshold=0.5,
-            debug=True,
-            template_name="Nút Captcha"
-        )
-        print(f"Kết quả: {result}")
-        
-        print("\n" + "=" * 60)
-        print("✅ ĐÃ HOÀN THÀNH TẤT CẢ BÀI KIỂM TRA!")
-        print("=" * 60)
-        
+        check_btn_start_video(screen, debug=True)
     except Exception as e:
         print(f"\n❌ LỖI: {e}")
         import traceback
